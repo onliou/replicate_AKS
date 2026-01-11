@@ -5,12 +5,11 @@ dataset_name=longvideobench
 # Set NUMEXPR_MAX_THREADS to avoid warnings
 export NUMEXPR_MAX_THREADS=64
 
-# Set HuggingFace to offline mode to avoid network connection errors
-# This forces transformers to use only local files
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-# Alternative: use HuggingFace mirror if available
-# export HF_ENDPOINT=https://hf-mirror.com
+# Use HuggingFace mirror to avoid network connection errors
+# If you have local cache, you can set offline mode instead
+# export HF_HUB_OFFLINE=1
+# export TRANSFORMERS_OFFLINE=1
+export HF_ENDPOINT=https://hf-mirror.com
 
 python ./evaluation/change_score.py \
     --base_score_path $base_score_path \

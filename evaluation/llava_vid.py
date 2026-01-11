@@ -3,10 +3,13 @@ import os
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
 
-# Set offline mode for HuggingFace to avoid network connection errors
-# This must be set before importing transformers
-os.environ.setdefault('HF_HUB_OFFLINE', '1')
-os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+# Use HuggingFace mirror to avoid network connection errors
+# If you have local cache, you can set offline mode instead
+# os.environ.setdefault('HF_HUB_OFFLINE', '1')
+# os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+# Use mirror site if HF_ENDPOINT is not set
+if 'HF_ENDPOINT' not in os.environ:
+    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 import numpy as np
 import torch
