@@ -1,19 +1,15 @@
-# Model shard files (模型分片文件)
+# Model shard files - exclude these
 *.safetensors
 *.bin
 *.pt
 *.pth
 *.ckpt
-model-*-of-*.safetensors
-model-*-of-*.bin
-model-*-of-*.pt
-model-*-of-*.pth
-
-# Training checkpoints
-training_args.bin
-optimizer.pt
-rng_state.pt
-scheduler.pt
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.pkl
+*.pickle
 
 # Python cache
 __pycache__/
@@ -21,13 +17,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
-
-# Environment
-.env
-.venv
-env/
-venv/
-ENV/
+*.egg-info/
+dist/
+build/
 
 # IDE
 .vscode/
@@ -38,37 +30,36 @@ ENV/
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Jupyter
-.ipynb_checkpoints
-*.ipynb_checkpoints
+.ipynb_checkpoints/
+*.ipynb
 
-# Large data files
+# Environment
+.env
+.venv
+env/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Large data files (but keep JSON)
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.zip
-*.tar.gz
 *.tar
+*.tar.gz
 *.gz
 
-# Results and outputs
-results/
-outscores/
-selected_frames/
-
-# Large output files
-outscores/**/*.json
-selected_frames/**/*.json
-results/**/*
-
-# Checkpoints directory (but keep structure)
-checkpoints/*/
-!checkpoints/.gitkeep
+# But explicitly include all JSON files
+!*.json
