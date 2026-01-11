@@ -1,0 +1,74 @@
+# Model shard files (模型分片文件)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+model-*-of-*.safetensors
+model-*-of-*.bin
+model-*-of-*.pt
+model-*-of-*.pth
+
+# Training checkpoints
+training_args.bin
+optimizer.pt
+rng_state.pt
+scheduler.pt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# Large data files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar.gz
+*.tar
+*.gz
+
+# Results and outputs
+results/
+outscores/
+selected_frames/
+
+# Large output files
+outscores/**/*.json
+selected_frames/**/*.json
+results/**/*
+
+# Checkpoints directory (but keep structure)
+checkpoints/*/
+!checkpoints/.gitkeep
