@@ -5,11 +5,26 @@ dataset_name=longvideobench
 # Set NUMEXPR_MAX_THREADS to avoid warnings
 export NUMEXPR_MAX_THREADS=64
 
+# Suppress H.264 decoding warnings (mmco: unref short failure)
+# These warnings are benign and don't affect video decoding functionality
+export DECORD_FFMPEG_LOGLEVEL=quiet
+export FFREPORT=file=/dev/null:level=quiet
+
 # Use HuggingFace mirror to avoid network connection errors
 # If you have local cache, you can set offline mode instead
 # export HF_HUB_OFFLINE=1
 # export TRANSFORMERS_OFFLINE=1
 export HF_ENDPOINT=https://hf-mirror.com
+
+# Optional: Download videos and extract pickle files before evaluation
+# Uncomment the following lines to enable automatic video download and pickle extraction
+# BATCH_SIZE=10
+# MAX_VIDEO_SIZE_GB=50
+# python download_and_extract_pickle.py \
+#     --dataset_name $dataset_name \
+#     --batch_size $BATCH_SIZE \
+#     --max_video_size_gb $MAX_VIDEO_SIZE_GB \
+#     --delete_after_extract
 
 python ./evaluation/change_score.py \
     --base_score_path $base_score_path \
@@ -28,7 +43,7 @@ if [ ! -d "$MODEL_PATH" ]; then
     exit 1
 fi
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --num_processes 8 --main_process_port 12345 -m lmms_eval \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch --num_processes 6 --main_process_port 12345 -m lmms_eval \
     --model llava_vid \
     --model_args pretrained=$MODEL_PATH,conv_template=chatml_direct,video_decode_backend=decord,max_frames_num=64,overwrite=False,use_topk=True \
     --tasks longvideobench_val_v \

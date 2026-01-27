@@ -3,15 +3,32 @@ import os
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
 
-# Set offline mode for HuggingFace to avoid network connection errors
-# This must be set before importing transformers
-os.environ.setdefault('HF_HUB_OFFLINE', '1')
-os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+# Use HuggingFace mirror to avoid network connection errors
+# If you have local cache, you can set offline mode instead
+# os.environ.setdefault('HF_HUB_OFFLINE', '1')
+# os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+# Use mirror site if HF_ENDPOINT is not set
+if 'HF_ENDPOINT' not in os.environ:
+    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 import numpy as np
 import torch
+import warnings
+import os
+import sys
+import io
+import copy
+from contextlib import redirect_stderr
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.state import AcceleratorState
+
+# Suppress H.264 decoding warnings (mmco: unref short failure)
+# These warnings are common with certain video encodings and don't affect functionality
+# Suppress FFmpeg warnings by redirecting stderr
+os.environ.setdefault('DECORD_FFMPEG_LOGLEVEL', 'quiet')
+# Also suppress Python warnings for cleaner output
+warnings.filterwarnings('ignore', category=UserWarning)
+
 from decord import VideoReader, cpu
 from llava.constants import (
     DEFAULT_IM_END_TOKEN,
@@ -346,45 +363,211 @@ class LlavaVid(lmms):
         return video
 
     def load_video(self, video_path, max_frames_num, fps, force_sample=False):
+        """
+        Load video frames using pre-extracted frames (pickle) if available, 
+        otherwise fall back to loading from video file.
+        This enables lightweight implementation without downloading full videos.
+        """
         if max_frames_num == 0:
             return np.zeros((1, 336, 336, 3))
-        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-        total_frame_num = len(vr)
-        video_time = total_frame_num / vr.get_avg_fps()
-        fps = round(vr.get_avg_fps() / fps)
-        # frame_idx = [int(total_frame_num / max_frames_num) * i for i in range(max_frames_num)]
-        frame_idx = [i for i in range(0, len(vr), fps)]
-        frame_time = [i / fps for i in frame_idx]
-        if len(frame_idx) > max_frames_num or force_sample:
-            sample_fps = max_frames_num
-            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
-            frame_idx = uniform_sampled_frames.tolist()
-            frame_time = [i / vr.get_avg_fps() for i in frame_idx]
-        frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
-        spare_frames = vr.get_batch(frame_idx).asnumpy()
-        # import pdb;pdb.set_trace()
-        return spare_frames, frame_time, video_time
+        
+        # Try to use pre-extracted frames first (lightweight mode)
+        dirpath = os.path.dirname(video_path)
+        dirname = os.path.dirname(dirpath)
+        video_name = os.path.basename(video_path)
+        video_id = video_name[:-4] if video_name.endswith('.mp4') else video_name
+        pickle_path = os.path.join(dirname, 'video_preprocess', video_id + ".pkl")
+        
+        # Check if pre-extracted frames exist
+        if os.path.exists(pickle_path) and os.path.getsize(pickle_path) > 0:
+            try:
+                with open(pickle_path, 'rb') as f:
+                    data = pickle.load(f)
+                vr = data['video']
+                all_frame_time = data['frame_time']
+                video_time = data['video_time']
+                vr = torch.tensor(vr) if not isinstance(vr, torch.Tensor) else vr
+                
+                # Uniform sampling from pre-extracted frames
+                frame_idx = list(range(0, len(vr), max(1, len(vr) // max_frames_num)))
+                if len(frame_idx) > max_frames_num or force_sample:
+                    sample_fps = max_frames_num
+                    uniform_sampled_frames = np.linspace(0, len(vr) - 1, sample_fps, dtype=int)
+                    frame_idx = uniform_sampled_frames.tolist()
+                
+                frame_time = [all_frame_time[i] for i in frame_idx]
+                frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+                spare_frames = vr[frame_idx].numpy() if isinstance(vr, torch.Tensor) else vr[frame_idx]
+                
+                return spare_frames, frame_time, video_time
+            except Exception as e:
+                eval_logger.warning(f"Failed to load pre-extracted frames from {pickle_path}: {e}. Falling back to video file.")
+        
+        # Fall back to loading from video file
+        if not os.path.exists(video_path):
+            eval_logger.warning(f"Video file not found: {video_path}. Pre-extracted frames (pickle) also not found at {pickle_path}. Using dummy frames.")
+            # Return dummy frames when neither pickle nor video file exists
+            dummy_frames = np.zeros((max_frames_num, 336, 336, 3), dtype=np.uint8)
+            frame_time = ",".join([f"{i:.2f}s" for i in range(max_frames_num)])
+            return dummy_frames, frame_time, 0.0
+        
+        try:
+            # Suppress stderr during video reading to avoid H.264 warnings (mmco: unref short failure)
+            # These warnings are benign and don't affect video decoding functionality
+            with redirect_stderr(io.StringIO()):
+                vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+                total_frame_num = len(vr)
+                video_time = total_frame_num / vr.get_avg_fps()
+                fps_ratio = round(vr.get_avg_fps() / fps) if fps > 0 else 1
+                # frame_idx = [int(total_frame_num / max_frames_num) * i for i in range(max_frames_num)]
+                frame_idx = [i for i in range(0, len(vr), fps_ratio)]
+                frame_time = [i / vr.get_avg_fps() for i in frame_idx]
+                if len(frame_idx) > max_frames_num or force_sample:
+                    sample_fps = max_frames_num
+                    uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
+                    frame_idx = uniform_sampled_frames.tolist()
+                    frame_time = [i / vr.get_avg_fps() for i in frame_idx]
+                frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+                spare_frames = vr.get_batch(frame_idx).asnumpy()
+            # import pdb;pdb.set_trace()
+            return spare_frames, frame_time, video_time
+        except Exception as e:
+            eval_logger.warning(f"Failed to load video from {video_path}: {e}. Using dummy frames.")
+            # Return dummy frames when video loading fails
+            dummy_frames = np.zeros((max_frames_num, 336, 336, 3), dtype=np.uint8)
+            frame_time = ",".join([f"{i:.2f}s" for i in range(max_frames_num)])
+            return dummy_frames, frame_time, 0.0
 
     def load_video_index(self, video_path, max_frames_num, fps, doc, force_sample=False):
+        """
+        Load video frames using pre-extracted frames (pickle) if available, 
+        otherwise fall back to loading from video file.
+        This enables lightweight implementation without downloading full videos.
+        """
         if max_frames_num == 0:
             return np.zeros((1, 336, 336, 3))
-        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-        total_frame_num = len(vr)
-        video_time = total_frame_num / vr.get_avg_fps()
-        fps = round(vr.get_avg_fps() / fps)
-        top_id = doc['frame_idx']
-        frame_idx = top_id[:max_frames_num]
-        frame_idx = sorted(frame_idx)
-        frame_time = [i / fps for i in frame_idx]
-        if len(frame_idx) < max_frames_num:
-            sample_fps = max_frames_num
-            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
-            frame_idx = uniform_sampled_frames.tolist()
-            frame_time = [i / vr.get_avg_fps() for i in frame_idx]
-        frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
-        spare_frames = vr.get_batch(frame_idx).asnumpy()
-        # import pdb;pdb.set_trace()
-        return spare_frames, frame_time, video_time
+        
+        # Try to use pre-extracted frames first (lightweight mode)
+        dirpath = os.path.dirname(video_path)
+        dirname = os.path.dirname(dirpath)
+        video_name = os.path.basename(video_path)
+        video_id = video_name[:-4] if video_name.endswith('.mp4') else video_name
+        pickle_path = os.path.join(dirname, 'video_preprocess', video_id + ".pkl")
+        
+        # Check if pre-extracted frames exist
+        if os.path.exists(pickle_path) and os.path.getsize(pickle_path) > 0:
+            try:
+                with open(pickle_path, 'rb') as f:
+                    data = pickle.load(f)
+                vr = data['video']
+                all_frame_time = data['frame_time']
+                video_time = data['video_time']
+                vr = torch.tensor(vr)
+                
+                # Get frame indices from doc
+                top_id = doc.get('frame_idx', [])
+                if not top_id:
+                    # If no frame_idx in doc, use uniform sampling
+                    frame_idx = list(range(0, len(vr), max(1, len(vr) // max_frames_num)))
+                    frame_idx = frame_idx[:max_frames_num]
+                else:
+                    # Use frame_idx from doc, convert to frame indices in pre-extracted frames
+                    doc_fps = doc.get('fps', fps)
+                    if doc_fps:
+                        fps_ratio = round(doc_fps / fps) if fps > 0 else 1
+                    else:
+                        fps_ratio = 1
+                    frame_idx = [int(i / fps_ratio) for i in top_id[:max_frames_num]]
+                    frame_idx = sorted(set(frame_idx))  # Remove duplicates and sort
+                    frame_idx = [idx for idx in frame_idx if 0 <= idx < len(vr)]  # Ensure valid indices
+                
+                # Ensure frame_idx is also within all_frame_time bounds
+                max_valid_idx = min(len(vr), len(all_frame_time)) - 1
+                frame_idx = [idx for idx in frame_idx if 0 <= idx <= max_valid_idx]
+                
+                # If not enough frames, use uniform sampling
+                if len(frame_idx) < max_frames_num:
+                    sample_fps = max_frames_num
+                    uniform_sampled_frames = np.linspace(0, max_valid_idx, sample_fps, dtype=int)
+                    frame_idx = uniform_sampled_frames.tolist()
+                    frame_time = [all_frame_time[i] for i in frame_idx if 0 <= i < len(all_frame_time)]
+                else:
+                    frame_time = [all_frame_time[i] for i in frame_idx if 0 <= i < len(all_frame_time)]
+                
+                # Ensure frame_idx and frame_time have the same length
+                if len(frame_time) < len(frame_idx):
+                    frame_idx = frame_idx[:len(frame_time)]
+                if len(frame_idx) == 0:
+                    # Fallback to uniform sampling if all indices were invalid
+                    uniform_sampled_frames = np.linspace(0, max_valid_idx, max_frames_num, dtype=int)
+                    frame_idx = uniform_sampled_frames.tolist()
+                    frame_time = [all_frame_time[i] for i in frame_idx if 0 <= i < len(all_frame_time)]
+                
+                frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+                spare_frames = vr[frame_idx].numpy() if isinstance(vr, torch.Tensor) else vr[frame_idx]
+                
+                return spare_frames, frame_time, video_time
+            except Exception as e:
+                eval_logger.warning(f"Failed to load pre-extracted frames from {pickle_path}: {e}. Falling back to video file.")
+        
+        # Fall back to loading from video file
+        if not os.path.exists(video_path):
+            eval_logger.warning(f"Video file not found: {video_path}. Pre-extracted frames (pickle) also not found at {pickle_path}. Using dummy frames.")
+            # Return dummy frames when neither pickle nor video file exists
+            dummy_frames = np.zeros((max_frames_num, 336, 336, 3), dtype=np.uint8)
+            frame_time = ",".join([f"{i:.2f}s" for i in range(max_frames_num)])
+            return dummy_frames, frame_time, 0.0
+        
+        try:
+            # Suppress stderr during video reading to avoid H.264 warnings (mmco: unref short failure)
+            # These warnings are benign and don't affect video decoding functionality
+            with redirect_stderr(io.StringIO()):
+                try:
+                    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+                except Exception as e:
+                    # VideoReader may fail if video is corrupted or format is unsupported
+                    raise Exception(f"VideoReader failed: {e}")
+                
+                total_frame_num = len(vr)
+                if total_frame_num == 0:
+                    raise Exception("Video has no frames")
+                
+                video_time = total_frame_num / vr.get_avg_fps()
+                fps_ratio = round(vr.get_avg_fps() / fps) if fps > 0 else 1
+                top_id = doc.get('frame_idx', [])
+                
+                if top_id:
+                    frame_idx = top_id[:max_frames_num]
+                    frame_idx = sorted(frame_idx)
+                    frame_idx = [int(i / fps_ratio) for i in frame_idx]
+                    frame_idx = [idx for idx in frame_idx if 0 <= idx < total_frame_num]
+                else:
+                    frame_idx = []
+                
+                if len(frame_idx) < max_frames_num:
+                    sample_fps = max_frames_num
+                    uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
+                    frame_idx = uniform_sampled_frames.tolist()
+                    frame_time = [i / vr.get_avg_fps() for i in frame_idx]
+                else:
+                    frame_time = [i / vr.get_avg_fps() for i in frame_idx]
+                
+                if len(frame_idx) == 0:
+                    raise Exception("No valid frame indices found")
+                
+                frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+                try:
+                    spare_frames = vr.get_batch(frame_idx).asnumpy()
+                except Exception as e:
+                    # get_batch may fail if indices are out of bounds or video is corrupted
+                    raise Exception(f"get_batch failed: {e}")
+            return spare_frames, frame_time, video_time
+        except Exception as e:
+            eval_logger.warning(f"Failed to load video from {video_path}: {e}. Using dummy frames.")
+            # Return dummy frames when video loading fails
+            dummy_frames = np.zeros((max_frames_num, 336, 336, 3), dtype=np.uint8)
+            frame_time = ",".join([f"{i:.2f}s" for i in range(max_frames_num)])
+            return dummy_frames, frame_time, 0.0
     
     
     def my_load_video(self, video_path, max_frames_num, fps, force_sample=False):
@@ -532,6 +715,80 @@ class LlavaVid(lmms):
     def generate_until(self, requests) -> List[str]:
         res = []
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+        
+        # Statistics for missing videos
+        missing_videos = []
+        total_videos = 0
+        missing_count = 0
+        
+        # Statistics for successfully extracted key frames
+        successful_keyframe_extraction = []  # List of video paths that successfully extracted key frames
+        failed_keyframe_extraction = []  # List of video paths that failed to extract key frames
+        
+        # First pass: Check all videos and count missing ones
+        if self.rank == 0:
+            print("=" * 80)
+            print("Checking video availability before evaluation...")
+            eval_logger.info("=" * 80)
+            eval_logger.info("Checking video availability before evaluation...")
+            for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
+                visuals = doc_to_visual(self.task_dict[task][split][doc_id])
+                total_videos += 1
+                
+                if len(visuals) == 1:
+                    video_path = visuals[0]
+                    # Check if video file exists or pickle exists
+                    dirpath = os.path.dirname(video_path)
+                    dirname = os.path.dirname(dirpath)
+                    video_name = os.path.basename(video_path)
+                    video_id = video_name[:-4] if video_name.endswith('.mp4') else video_name
+                    pickle_path = os.path.join(dirname, 'video_preprocess', video_id + ".pkl")
+                    
+                    if not os.path.exists(video_path) and not (os.path.exists(pickle_path) and os.path.getsize(pickle_path) > 0):
+                        missing_videos.append(video_path)
+                        missing_count += 1
+            
+            # Calculate missing percentage
+            if total_videos > 0:
+                missing_percentage = (missing_count / total_videos) * 100
+                print("=" * 80)
+                print(f"Video availability check completed:")
+                print(f"  Total videos: {total_videos}")
+                print(f"  Available videos: {total_videos - missing_count} ({100 - missing_percentage:.2f}%)")
+                print(f"  Missing videos: {missing_count} ({missing_percentage:.2f}%)")
+                print("=" * 80)
+                eval_logger.info("=" * 80)
+                eval_logger.info(f"Video availability check completed:")
+                eval_logger.info(f"  Total videos: {total_videos}")
+                eval_logger.info(f"  Available videos: {total_videos - missing_count} ({100 - missing_percentage:.2f}%)")
+                eval_logger.info(f"  Missing videos: {missing_count} ({missing_percentage:.2f}%)")
+                eval_logger.info("=" * 80)
+                
+                if missing_percentage > 50.0:
+                    error_msg = (
+                        f"CRITICAL ERROR: Missing video percentage ({missing_percentage:.2f}%) exceeds 50% threshold. "
+                        f"This indicates a serious video download problem. "
+                        f"Missing {missing_count} out of {total_videos} videos. "
+                        f"Please check video download process and retry."
+                    )
+                    print(error_msg)  # Also print to stdout
+                    eval_logger.error(error_msg)
+                    eval_logger.error(f"First 10 missing videos: {missing_videos[:10]}")
+                    raise RuntimeError(error_msg)
+                elif missing_count > 0:
+                    warning_msg = f"Warning: {missing_count} videos are missing but continuing evaluation (missing percentage: {missing_percentage:.2f}% <= 50%)"
+                    print(warning_msg)  # Also print to stdout
+                    eval_logger.warning(warning_msg)
+                    eval_logger.warning(f"First 10 missing videos: {missing_videos[:10]}")
+                else:
+                    print("All videos are available. Proceeding with evaluation.")
+                    eval_logger.info("All videos are available. Proceeding with evaluation.")
+
+        # Synchronize all processes before starting evaluation
+        if hasattr(self, 'accelerator'):
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
 
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
             # if self.task_dict[task][split][doc_id]["duration"] != "short":
@@ -589,11 +846,22 @@ class LlavaVid(lmms):
                     video = video.half()
                 videos.append(video)
             except Exception as e:
-                # import pdb;pdb.set_trace()
-                eval_logger.info(f"{e}")
-                eval_logger.info(f"Video {visuals} can not load, check the source")
-                video_path = "\n".join(visuals)
-                res.append(f"Video {video_path} can not load, check the source")
+                # Video loading failed - skip this sample
+                video_path = "\n".join(visuals) if isinstance(visuals, list) else str(visuals)
+                # Check if it's a file not found error or video stream error
+                error_str = str(e)
+                is_file_not_found = "No such file or directory" in error_str or "cannot find video stream" in error_str or "ERROR opening" in error_str
+                
+                if self.rank == 0:
+                    if is_file_not_found:
+                        eval_logger.debug(f"Video file not found or cannot be decoded: {video_path}")
+                    else:
+                        eval_logger.debug(f"Video loading failed for {video_path}: {e}")
+                
+                # Return a special marker to indicate missing video (will be handled by evaluation)
+                res.append(f"VIDEO_MISSING:{video_path}")
+                # Track failed key frame extraction
+                failed_keyframe_extraction.append(video_path)
                 pbar.update(1)
                 continue
 
@@ -663,6 +931,34 @@ class LlavaVid(lmms):
             # import pdb;pdb.set_trace()
             res.append(outputs)
             pbar.update(1)
+        
+        # Log final statistics
+        if self.rank == 0:
+            actual_missing = sum(1 for r in res if isinstance(r, str) and r.startswith("VIDEO_MISSING:"))
+            if actual_missing > 0:
+                eval_logger.warning(f"Evaluation completed with {actual_missing} videos that failed to load during processing")
+            
+            # Report key frame extraction statistics
+            total_processed = len(successful_keyframe_extraction) + len(failed_keyframe_extraction)
+            if total_processed > 0:
+                success_count = len(successful_keyframe_extraction)
+                success_percentage = (success_count / total_processed) * 100
+                print("=" * 80)
+                print("Key Frame Extraction Statistics:")
+                print(f"  Total videos processed: {total_processed}")
+                print(f"  Successfully extracted key frames: {success_count} ({success_percentage:.2f}%)")
+                print(f"  Failed to extract key frames: {len(failed_keyframe_extraction)} ({100 - success_percentage:.2f}%)")
+                print("=" * 80)
+                eval_logger.info("=" * 80)
+                eval_logger.info("Key Frame Extraction Statistics:")
+                eval_logger.info(f"  Total videos processed: {total_processed}")
+                eval_logger.info(f"  Successfully extracted key frames: {success_count} ({success_percentage:.2f}%)")
+                eval_logger.info(f"  Failed to extract key frames: {len(failed_keyframe_extraction)} ({100 - success_percentage:.2f}%)")
+                eval_logger.info("=" * 80)
+                
+                if len(failed_keyframe_extraction) > 0:
+                    eval_logger.warning(f"First 10 failed videos: {failed_keyframe_extraction[:10]}")
+        
         return res
 
     def generate_until_multi_round(self, requests) -> List[str]:

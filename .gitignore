@@ -63,3 +63,14 @@ logs/
 
 # But explicitly include all JSON files
 !*.json
+
+# Model checkpoints / shards - ignore entire checkpoint directories
+checkpoints/
+
+# Videos - ignore video directories and in-progress download artifacts
+**/videos/
+**/*.part
+**/*.ytdl
+
+# Evaluation outputs
+results/
